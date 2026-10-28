@@ -52,7 +52,7 @@ long rawToGrams(int i, long raw) {
 }
 
 // Presence threshold, in grams (default 700 g ~= the old 300 counts)
-long presenceThreshold[4] = {700, 700, 700, 700};
+long presenceThreshold[4] = {3000, 3000, 3000, 3000};
 long lastKnownReading[4] = {0, 0, 0, 0};   // averaged weight in grams
 long lastRawAvg[4] = {0, 0, 0, 0};         // averaged raw counts (diagnostics)
 
