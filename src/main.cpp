@@ -19,7 +19,8 @@ bool rtcOk = false;
 
 // ---------- Persistence (NVS via Preferences) ----------
 Preferences prefs;
-const char* PREFS_NAMESPACE = "shelfcfg";
+// New namespace in Stage 14: thresholds are now stored in grams, not raw counts.
+const char* PREFS_NAMESPACE = "shelfcfg2";
 
 // ---------- Hardware config ----------
 const int HX711_DOUT[4] = {32, 33, 25, 26};
@@ -37,14 +38,29 @@ const char* names[4] = {"Guitar", "Violin", "Keyboard", "Flute"};
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-long presenceThreshold[4] = {300, 300, 300, 300};
-long lastKnownReading[4] = {0, 0, 0, 0};
+// ---------- Weight conversion (Stage 14) ----------
+// Wokwi's 5 kg load cell reads about 2100 raw counts at full scale,
+// i.e. 0.42 counts per gram. Stored as x1000 so all math stays integer.
+// grams = (raw - offset) * 1000 / COUNTS_PER_GRAM_X1000
+const long COUNTS_PER_GRAM_X1000 = 420;
+long rawOffset[4] = {0, 0, 0, 0};
+const long MAX_WEIGHT_G = 5000;   // 5 kg cell capacity
+
+long rawToGrams(int i, long raw) {
+  int64_t g = ((int64_t)(raw - rawOffset[i]) * 1000) / COUNTS_PER_GRAM_X1000;
+  return (long)g;
+}
+
+// Presence threshold, in grams (default 700 g ~= the old 300 counts)
+long presenceThreshold[4] = {700, 700, 700, 700};
+long lastKnownReading[4] = {0, 0, 0, 0};   // averaged weight in grams
+long lastRawAvg[4] = {0, 0, 0, 0};         // averaged raw counts (diagnostics)
 
 long ratePerHourPaise[4] = {10000, 15000, 12000, 8000};
 long lastCostPaise[4] = {-1, -1, -1, -1};
 
 const int AVG_SAMPLES = 5;
-long sampleBuffer[4][AVG_SAMPLES] = {{0}};
+long sampleBuffer[4][AVG_SAMPLES] = {{0}};   // raw counts
 int sampleIndex[4] = {0, 0, 0, 0};
 bool bufferFilled[4] = {false, false, false, false};
 
@@ -109,6 +125,15 @@ const bool PROFILER_ENABLED = false;
 unsigned long loopCount = 0;
 unsigned long lastProfilerReport = 0;
 
+// ---------- Sensor diagnostics (Stage 14) ----------
+// Prints, every 2s per slot: how many times the HX711 reported ready vs
+// not ready, the averaged raw count, and the weight in grams.
+// Set to false once the Guitar issue is solved.
+const bool SENSOR_DEBUG = false;
+unsigned long readyCount[4] = {0, 0, 0, 0};
+unsigned long notReadyCount[4] = {0, 0, 0, 0};
+unsigned long lastSensorDebug = 0;
+
 const char* stateName(InstrumentState s) {
   switch (s) {
     case AVAILABLE: return "AVAILABLE";
@@ -154,6 +179,12 @@ void formatRupees(long paise, char *out, size_t outLen) {
   snprintf(out, outLen, "Rs.%ld.%02ld", rupees, p);
 }
 
+// Grams -> "0.70 kg" (two decimals, so a 50 g step shows as 0.05 kg)
+void formatKg(long grams, char *out, size_t outLen) {
+  if (grams < 0) grams = 0;
+  snprintf(out, outLen, "%ld.%02ld kg", grams / 1000, (grams % 1000) / 10);
+}
+
 void loadConfig() {
   prefs.begin(PREFS_NAMESPACE, true);
   for (int i = 0; i < 4; i++) {
@@ -176,7 +207,9 @@ void loadConfig() {
     Serial.print("  ");
     Serial.print(names[i]);
     Serial.print(": threshold=");
-    Serial.print(presenceThreshold[i]);
+    char kgStr[16];
+    formatKg(presenceThreshold[i], kgStr, sizeof(kgStr));
+    Serial.print(kgStr);
     Serial.print(" limit=");
     Serial.print(usageLimitMs[i] / 1000);
     Serial.print("s rate=");
@@ -205,12 +238,6 @@ void saveConfig(int i) {
   Serial.println(names[i]);
 }
 
-// DIAGNOSTIC: re-opens NVS and reads a slot's keys straight back, in the
-// SAME boot, right after saveConfig(). If these match what was just saved,
-// the write path itself is proven correct -- any later restart-persistence
-// failure is then Wokwi's virtual flash, not our code. If these DON'T
-// match, the write itself is broken and needs fixing before it ever
-// reaches real hardware.
 void verifyReadback(int i) {
   prefs.begin(PREFS_NAMESPACE, true);
   char key[4];
@@ -229,7 +256,9 @@ void verifyReadback(int i) {
   Serial.print("[prefs] readback (same session) ");
   Serial.print(names[i]);
   Serial.print(": threshold=");
-  Serial.print(t);
+  char kgStr[16];
+  formatKg(t, kgStr, sizeof(kgStr));
+  Serial.print(kgStr);
   Serial.print(" limit=");
   Serial.print(l);
   Serial.print("s rate=");
@@ -240,7 +269,7 @@ void verifyReadback(int i) {
 
 long cfgGetValue(int ch, ConfigField f) {
   switch (f) {
-    case CFG_THRESHOLD: return presenceThreshold[ch];
+    case CFG_THRESHOLD: return presenceThreshold[ch];   // grams
     case CFG_LIMIT:      return usageLimitMs[ch] / 1000;
     case CFG_RATE:        return ratePerHourPaise[ch];
     default: return 0;
@@ -250,9 +279,9 @@ long cfgGetValue(int ch, ConfigField f) {
 void cfgAdjustValue(int ch, ConfigField f, int direction) {
   switch (f) {
     case CFG_THRESHOLD: {
-      long v = presenceThreshold[ch] + (direction * 50);
+      long v = presenceThreshold[ch] + (direction * 50);   // 50 g = 0.05 kg
       if (v < 0) v = 0;
-      if (v > 4000) v = 4000;
+      if (v > MAX_WEIGHT_G) v = MAX_WEIGHT_G;
       presenceThreshold[ch] = v;
       break;
     }
@@ -277,16 +306,26 @@ void cfgAdjustValue(int ch, ConfigField f, int direction) {
   Serial.print("[config] ");
   Serial.print(cfgFieldNames[f]);
   Serial.print(" now ");
-  Serial.println(cfgGetValue(ch, f));
+  if (f == CFG_THRESHOLD) {
+    char kgStr[16];
+    formatKg(cfgGetValue(ch, f), kgStr, sizeof(kgStr));
+    Serial.println(kgStr);
+  } else {
+    Serial.println(cfgGetValue(ch, f));
+  }
 }
 
 bool pollChannel(int i) {
   if (!scale[i].is_ready()) {
+    notReadyCount[i]++;
     return false;
   }
+  readyCount[i]++;
 
-  long sample = scale[i].get_units(1);
-  sampleBuffer[i][sampleIndex[i]] = sample;
+  // read() returns the raw 24-bit count. HX711 is already ready here,
+  // so this does not wait.
+  long raw = scale[i].read();
+  sampleBuffer[i][sampleIndex[i]] = raw;
   sampleIndex[i] = (sampleIndex[i] + 1) % AVG_SAMPLES;
   if (sampleIndex[i] == 0) {
     bufferFilled[i] = true;
@@ -295,11 +334,12 @@ bool pollChannel(int i) {
   int count = bufferFilled[i] ? AVG_SAMPLES : sampleIndex[i];
   if (count == 0) count = 1;
 
-  long sum = 0;
+  long long sum = 0;
   for (int k = 0; k < count; k++) {
     sum += sampleBuffer[i][k];
   }
-  lastKnownReading[i] = sum / count;
+  lastRawAvg[i] = (long)(sum / count);
+  lastKnownReading[i] = rawToGrams(i, lastRawAvg[i]);
   return true;
 }
 
@@ -472,12 +512,14 @@ void enterConfigMode() {
 
 void exitConfigMode() {
   saveConfig(configChannel);
-  verifyReadback(configChannel); // same-session proof the write path works
+  verifyReadback(configChannel);
 
   Serial.print("[config] exited, ");
   Serial.print(names[configChannel]);
   Serial.print(" threshold=");
-  Serial.print(presenceThreshold[configChannel]);
+  char kgStr[16];
+  formatKg(presenceThreshold[configChannel], kgStr, sizeof(kgStr));
+  Serial.print(kgStr);
   Serial.print(" limit=");
   Serial.print(usageLimitMs[configChannel] / 1000);
   Serial.print("s rate=");
@@ -594,9 +636,12 @@ void updateLCD(unsigned long now) {
 
     long val = cfgGetValue(configChannel, configField);
     switch (configField) {
-      case CFG_THRESHOLD:
-        snprintf(line1buf, sizeof(line1buf), "%-16ld", val);
+      case CFG_THRESHOLD: {
+        char kgStr[16];
+        formatKg(val, kgStr, sizeof(kgStr));
+        snprintf(line1buf, sizeof(line1buf), "%-16s", kgStr);
         break;
+      }
       case CFG_LIMIT:
         snprintf(line1buf, sizeof(line1buf), "%lds%-13s", val, "");
         break;
@@ -661,13 +706,41 @@ void initializeState(int i) {
   }
   Serial.print(names[i]);
   Serial.print(": boot state -> ");
-  Serial.println(stateName(state[i]));
+  Serial.print(stateName(state[i]));
+  if (!gotReading) {
+    Serial.print("  (WARNING: HX711 never became ready at boot)");
+  }
+  Serial.println();
+}
+
+void printSensorDebug() {
+  for (int i = 0; i < 4; i++) {
+    char kgStr[16];
+    formatKg(lastKnownReading[i], kgStr, sizeof(kgStr));
+    Serial.print("[sensor] ");
+    Serial.print(names[i]);
+    Serial.print(" ready=");
+    Serial.print(readyCount[i]);
+    Serial.print(" notReady=");
+    Serial.print(notReadyCount[i]);
+    Serial.print(" rawAvg=");
+    Serial.print(lastRawAvg[i]);
+    Serial.print(" weight=");
+    Serial.print(lastKnownReading[i]);
+    Serial.print("g (");
+    Serial.print(kgStr);
+    Serial.print(") thresh=");
+    Serial.print(presenceThreshold[i]);
+    Serial.println("g");
+    readyCount[i] = 0;
+    notReadyCount[i] = 0;
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("Stage 13b: same-session write/read-back verification...");
+  Serial.println("Stage 14: kg thresholds + sensor diagnostics...");
 
   loadConfig();
 
@@ -713,6 +786,7 @@ void setup() {
 
   lastLcdSwitch = millis();
   lastProfilerReport = millis();
+  lastSensorDebug = millis();
 }
 
 void loop() {
@@ -728,6 +802,11 @@ void loop() {
   pollButtons(now);
   updateBuzzer(now);
   updateLCD(now);
+
+  if (SENSOR_DEBUG && (now - lastSensorDebug >= 2000)) {
+    printSensorDebug();
+    lastSensorDebug = now;
+  }
 
   if (PROFILER_ENABLED && (now - lastProfilerReport >= 2000)) {
     Serial.print("[profiler] loop() calls in last ~2s: ");
